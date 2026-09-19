@@ -11,17 +11,16 @@ from kivy.core.window import Window
 from kivy.properties import NumericProperty, BooleanProperty
 
 # ---------------- Tunable constants ----------------
-GRAVITY = -1500
-JUMP_VELOCITY = 950
+GRAVITY = -1300
+JUMP_VELOCITY = 1100
 ROCKET_VELOCITY = 1700
-PLATFORM_W = 110
+PLATFORM_W = 160
 PLATFORM_H = 32
 PLAYER_W = 70
 PLAYER_H = 70
-STAGE_HEIGHT = 1400          # score (px climbed) per "stage" for shield reset
+STAGE_HEIGHT = 1400
 STARS_FOR_CHECKPOINT = 3
-SCROLL_START_Y = 0.45        # fraction of screen height where player triggers scroll
-
+SCROLL_START_Y = 0.45
 
 class GameWidget(FloatLayout):
     def __init__(self, app, **kwargs):
