@@ -19,8 +19,9 @@ PLAYER_H = 70
 STAGE_HEIGHT = 1400          # score (px) per stage
 STARS_FOR_CHECKPOINT = 3
 SCROLL_START_Y = 0.45        # fraction of screen height where the world starts scrolling
-MOVE_SPEED = 700             # horizontal speed while a finger is held (px/s)
-MOVE_SMOOTH = 14             # higher = snappier turning
+FOLLOW = 12                  # how quickly the frog follows your finger
+MAX_MOVE_SPEED = 1200        # top horizontal speed (px/s)
+MIRROR_TOUCH = False         # set to True if the frog goes the opposite way of your finger
 
 
 class GameWidget(FloatLayout):
@@ -78,8 +79,7 @@ class GameWidget(FloatLayout):
 
     def reset_state(self, full_reset=False):
         self.vel_y = 0
-        self.vx = 0
-        self.touch_dir = 0
+        self.target_x = None
         self._active_touch = None
         self.scroll_offset = 0
         self.score = 0
@@ -147,30 +147,31 @@ class GameWidget(FloatLayout):
         self.vel_y = JUMP_VELOCITY * 0.6
 
     # ---------------- input ----------------
-    # Hold your finger on the left half of the screen to move left,
-    # on the right half to move right. Lift the finger to stop.
-    def _set_dir(self, touch):
-        self.touch_dir = -1 if touch.x < self.width / 2 else 1
+    # Touch anywhere and the frog goes to where your finger is.
+    # Slide your finger left/right to steer. Lift the finger and the frog stays put.
+    def _set_target(self, touch):
+        x = self.width - touch.x if MIRROR_TOUCH else touch.x
+        self.target_x = x - PLAYER_W / 2
 
     def on_touch_down(self, touch):
         if self.game_over:
             return False
         self._active_touch = touch
-        self._set_dir(touch)
+        self._set_target(touch)
         return True
 
     def on_touch_move(self, touch):
         if self.game_over:
             return False
         if touch is self._active_touch:
-            self._set_dir(touch)
+            self._set_target(touch)
             return True
         return False
 
     def on_touch_up(self, touch):
         if touch is self._active_touch:
             self._active_touch = None
-            self.touch_dir = 0
+            self.target_x = None
             return True
         return False
 
@@ -232,15 +233,15 @@ class GameWidget(FloatLayout):
         self.shield_label.text = "SHIELD" if self.shield_active else ""
 
     def handle_horizontal(self, dt):
-        # smooth steering: move toward the side you are touching
-        target = self.touch_dir * MOVE_SPEED
-        self.vx += (target - self.vx) * min(1.0, MOVE_SMOOTH * dt)
-        self.player.x += self.vx * dt
-        # wrap around the screen edges
-        if self.player.x < -PLAYER_W / 2:
-            self.player.x = self.width_ - PLAYER_W / 2
-        elif self.player.x > self.width_ - PLAYER_W / 2:
-            self.player.x = -PLAYER_W / 2
+        # move toward the finger smoothly, with a speed limit
+        if self.target_x is not None:
+            diff = self.target_x - self.player.x
+            step = diff * min(1.0, FOLLOW * dt)
+            max_step = MAX_MOVE_SPEED * dt
+            step = max(-max_step, min(max_step, step))
+            self.player.x += step
+        # stay inside the screen
+        self.player.x = max(0, min(self.width_ - PLAYER_W, self.player.x))
 
     def land_on_platform(self, p):
         self.vel_y = JUMP_VELOCITY
@@ -315,8 +316,7 @@ class GameWidget(FloatLayout):
             self.player.y = self.height_ * SCROLL_START_Y - 40
             return
         self.game_over = True
-        self.touch_dir = 0
-        self.vx = 0
+        self.target_x = None
         self.app.show_game_over(self.score, self.checkpoint_score)
 
     def restart_from_checkpoint(self):
