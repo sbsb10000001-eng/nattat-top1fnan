@@ -1,6 +1,5 @@
 import random
 from kivy.app import App
-from kivy.uix.widget import Widget
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
@@ -8,7 +7,6 @@ from kivy.uix.image import Image
 from kivy.graphics import Rectangle, Color
 from kivy.clock import Clock
 from kivy.core.window import Window
-from kivy.properties import NumericProperty, BooleanProperty
 
 # ---------------- Tunable constants ----------------
 GRAVITY = -1300
@@ -18,9 +16,12 @@ PLATFORM_W = 160
 PLATFORM_H = 32
 PLAYER_W = 70
 PLAYER_H = 70
-STAGE_HEIGHT = 1400
+STAGE_HEIGHT = 1400          # score (px) per stage
 STARS_FOR_CHECKPOINT = 3
-SCROLL_START_Y = 0.45
+SCROLL_START_Y = 0.45        # fraction of screen height where the world starts scrolling
+MOVE_SPEED = 700             # horizontal speed while a finger is held (px/s)
+MOVE_SMOOTH = 14             # higher = snappier turning
+
 
 class GameWidget(FloatLayout):
     def __init__(self, app, **kwargs):
@@ -35,37 +36,38 @@ class GameWidget(FloatLayout):
         self.bind(size=self._update_bg, pos=self._update_bg)
 
         # state
+        self._active_touch = None
         self.reset_state(full_reset=True)
 
         # player sprite
         self.player = Image(source="assets/character.png", size=(PLAYER_W, PLAYER_H),
-                             size_hint=(None, None))
+                            size_hint=(None, None))
         self.add_widget(self.player)
 
         # HUD
         self.score_label = Label(text="0", font_size=28, bold=True,
-                                  pos_hint={"x": 0.02, "top": 0.99}, size_hint=(None, None),
-                                  size=(150, 40), color=(0.1, 0.1, 0.1, 1))
+                                 pos_hint={"x": 0.02, "top": 0.99}, size_hint=(None, None),
+                                 size=(150, 40), color=(0.1, 0.1, 0.1, 1))
         self.add_widget(self.score_label)
 
-        self.stars_label = Label(text="⭐ 0/3", font_size=22, bold=True,
-                                  pos_hint={"right": 0.98, "top": 0.99}, size_hint=(None, None),
-                                  size=(150, 40), color=(0.5, 0.3, 0, 1))
+        self.stars_label = Label(text=f"Stars {self.total_stars}/{STARS_FOR_CHECKPOINT}",
+                                 font_size=22, bold=True,
+                                 pos_hint={"right": 0.98, "top": 0.99}, size_hint=(None, None),
+                                 size=(180, 40), color=(0.5, 0.3, 0, 1))
         self.add_widget(self.stars_label)
 
         self.shield_label = Label(text="", font_size=20, bold=True,
-                                   pos_hint={"center_x": 0.5, "top": 0.99}, size_hint=(None, None),
-                                   size=(200, 40), color=(0.1, 0.6, 0.1, 1))
+                                  pos_hint={"center_x": 0.5, "top": 0.99}, size_hint=(None, None),
+                                  size=(200, 40), color=(0.1, 0.6, 0.1, 1))
         self.add_widget(self.shield_label)
 
         self.platform_widgets = []
-        self.item_widgets = []  # list of dicts: {"widget", "kind", "platform"}
+        self.item_widgets = []  # list of dicts: {"widget", "kind", "platform", "collected"}
 
         self.spawn_initial_platforms()
         self.place_player_on_start()
 
         Clock.schedule_interval(self.update, 1 / 60)
-        Window.bind(on_touch_down=self.on_touch)
 
     # ---------------- setup helpers ----------------
     def _update_bg(self, *args):
@@ -76,6 +78,9 @@ class GameWidget(FloatLayout):
 
     def reset_state(self, full_reset=False):
         self.vel_y = 0
+        self.vx = 0
+        self.touch_dir = 0
+        self._active_touch = None
         self.scroll_offset = 0
         self.score = 0
         self.max_score = 0
@@ -90,10 +95,11 @@ class GameWidget(FloatLayout):
             self.checkpoint_platform_seed = None
 
     def clear_world(self):
-        for w in self.platform_widgets:
+        for w in getattr(self, "platform_widgets", []):
             self.remove_widget(w["widget"])
-        for it in self.item_widgets:
-            self.remove_widget(it["widget"])
+        for it in getattr(self, "item_widgets", []):
+            if it["widget"].parent:
+                self.remove_widget(it["widget"])
         self.platform_widgets = []
         self.item_widgets = []
 
@@ -120,7 +126,7 @@ class GameWidget(FloatLayout):
         pdata = {"widget": w, "x": x, "y": y, "breakable": breakable, "broken": False}
         self.platform_widgets.append(pdata)
 
-        # chance to spawn item on top
+        # chance of an item on top
         roll = random.random()
         if roll < 0.12:
             self.add_item(x + PLATFORM_W / 2 - 16, y + PLATFORM_H, "star", pdata)
@@ -141,22 +147,43 @@ class GameWidget(FloatLayout):
         self.vel_y = JUMP_VELOCITY * 0.6
 
     # ---------------- input ----------------
-    def on_touch(self, window, touch):
+    # Hold your finger on the left half of the screen to move left,
+    # on the right half to move right. Lift the finger to stop.
+    def _set_dir(self, touch):
+        self.touch_dir = -1 if touch.x < self.width / 2 else 1
+
+    def on_touch_down(self, touch):
         if self.game_over:
-            return
-        # simple: tap left half = move left, right half = move right (auto-jump handles vertical)
-        pass
+            return False
+        self._active_touch = touch
+        self._set_dir(touch)
+        return True
+
+    def on_touch_move(self, touch):
+        if self.game_over:
+            return False
+        if touch is self._active_touch:
+            self._set_dir(touch)
+            return True
+        return False
+
+    def on_touch_up(self, touch):
+        if touch is self._active_touch:
+            self._active_touch = None
+            self.touch_dir = 0
+            return True
+        return False
 
     # ---------------- game loop ----------------
     def update(self, dt):
         if self.game_over:
             return
+        dt = min(dt, 1 / 30)  # avoid big jumps when a frame is slow
 
-        # horizontal auto drift toward center-ish random walk via touch could be added;
-        # for now, gentle auto side-to-side using accelerometer-less simple AI drift
         self.handle_horizontal(dt)
 
         # physics
+        prev_y = self.player.y
         if self.rocket_active:
             self.vel_y = ROCKET_VELOCITY
             self.rocket_timer -= dt
@@ -165,21 +192,21 @@ class GameWidget(FloatLayout):
         else:
             self.vel_y += GRAVITY * dt
 
-        new_y = self.player.y + self.vel_y * dt
-        self.player.y = new_y
+        self.player.y = self.player.y + self.vel_y * dt
 
-        # collision with platforms only when falling
+        # platform collisions only while falling
         if self.vel_y <= 0:
             for p in self.platform_widgets:
                 if p["broken"]:
                     continue
                 px, py = p["x"], p["y"]
+                top = py + PLATFORM_H
                 if (self.player.x + PLAYER_W * 0.7 > px and self.player.x + PLAYER_W * 0.3 < px + PLATFORM_W
-                        and self.player.y <= py + PLATFORM_H and self.player.y >= py - 10):
+                        and prev_y >= top - 12 and self.player.y <= top):
                     self.land_on_platform(p)
                     break
 
-        # scroll world when player climbs above threshold
+        # scroll the world when the player passes the threshold
         threshold = self.height_ * SCROLL_START_Y
         if self.player.y > threshold:
             dy = self.player.y - threshold
@@ -189,9 +216,11 @@ class GameWidget(FloatLayout):
         # item collisions
         self.check_item_collisions()
 
-        # fell off bottom -> die
+        # fell off the bottom -> die
         if self.player.y < -PLAYER_H:
             self.die()
+            if self.game_over:
+                return
 
         # update score
         self.score = max(self.score, int(self.scroll_offset))
@@ -199,20 +228,15 @@ class GameWidget(FloatLayout):
         stage = self.score // STAGE_HEIGHT
         if stage != self.current_stage:
             self.current_stage = stage
-            self.shield_active = False  # shield resets each new stage until re-earned
-        self.shield_label.text = "🛡️ محمي" if self.shield_active else ""
+            self.shield_active = False  # shield resets every new stage until earned again
+        self.shield_label.text = "SHIELD" if self.shield_active else ""
 
     def handle_horizontal(self, dt):
-        # gentle continuous drift + wrap around screen edges (auto-runner style)
-        if not hasattr(self, "_dir"):
-            self._dir = random.choice([-1, 1])
-            self._dir_timer = random.uniform(0.8, 1.8)
-        self._dir_timer -= dt
-        if self._dir_timer <= 0:
-            self._dir = random.choice([-1, 1])
-            self._dir_timer = random.uniform(0.8, 1.8)
-        speed = 140
-        self.player.x += self._dir * speed * dt
+        # smooth steering: move toward the side you are touching
+        target = self.touch_dir * MOVE_SPEED
+        self.vx += (target - self.vx) * min(1.0, MOVE_SMOOTH * dt)
+        self.player.x += self.vx * dt
+        # wrap around the screen edges
         if self.player.x < -PLAYER_W / 2:
             self.player.x = self.width_ - PLAYER_W / 2
         elif self.player.x > self.width_ - PLAYER_W / 2:
@@ -261,8 +285,9 @@ class GameWidget(FloatLayout):
             if it["collected"]:
                 continue
             w = it["widget"]
-            if (self.player.x < w.x + w.width and self.player.x + PLAYER_W > w.x
-                    and self.player.y < w.y + w.height and self.player.y + PLAYER_H > w.y):
+            wx, wy = w.x, w.y
+            if (self.player.x < wx + w.width and self.player.x + PLAYER_W > wx
+                    and self.player.y < wy + w.height and self.player.y + PLAYER_H > wy):
                 it["collected"] = True
                 w.opacity = 0
                 if it["kind"] == "star":
@@ -276,7 +301,7 @@ class GameWidget(FloatLayout):
             self.total_stars = 0
             self.checkpoint_score = self.score
             self.shield_active = True
-        self.stars_label.text = f"⭐ {self.total_stars}/{STARS_FOR_CHECKPOINT}"
+        self.stars_label.text = f"Stars {self.total_stars}/{STARS_FOR_CHECKPOINT}"
 
     def activate_rocket(self):
         self.rocket_active = True
@@ -284,12 +309,14 @@ class GameWidget(FloatLayout):
 
     def die(self):
         if self.shield_active:
-            # shield absorbs the fall/hit once, respawn near current height
+            # the shield absorbs the fall once and bounces the player back up
             self.shield_active = False
             self.vel_y = JUMP_VELOCITY
             self.player.y = self.height_ * SCROLL_START_Y - 40
             return
         self.game_over = True
+        self.touch_dir = 0
+        self.vx = 0
         self.app.show_game_over(self.score, self.checkpoint_score)
 
     def restart_from_checkpoint(self):
@@ -297,7 +324,7 @@ class GameWidget(FloatLayout):
         self.score = self.checkpoint_score
         self.spawn_initial_platforms()
         self.place_player_on_start()
-        self.stars_label.text = f"⭐ {self.total_stars}/{STARS_FOR_CHECKPOINT}"
+        self.stars_label.text = f"Stars {self.total_stars}/{STARS_FOR_CHECKPOINT}"
 
 
 class MenuScreen(FloatLayout):
@@ -307,15 +334,15 @@ class MenuScreen(FloatLayout):
             self.bg = Rectangle(source="assets/bg.png", pos=(0, 0), size=Window.size)
         self.bind(size=self._upd, pos=self._upd)
 
-        title = Label(text="نطاط", font_size=64, bold=True, color=(0.1, 0.3, 0.1, 1),
-                       pos_hint={"center_x": 0.5, "center_y": 0.65})
+        title = Label(text="Nattat", font_size=64, bold=True, color=(0.1, 0.3, 0.1, 1),
+                      pos_hint={"center_x": 0.5, "center_y": 0.65})
         self.add_widget(title)
 
         char = Image(source="assets/character.png", size=(140, 140), size_hint=(None, None),
-                      pos_hint={"center_x": 0.5, "center_y": 0.45})
+                     pos_hint={"center_x": 0.5, "center_y": 0.45})
         self.add_widget(char)
 
-        btn = Button(text="ابدأ اللعب", font_size=28, size_hint=(None, None), size=(220, 70),
+        btn = Button(text="Start", font_size=28, size_hint=(None, None), size=(220, 70),
                      pos_hint={"center_x": 0.5, "center_y": 0.22},
                      background_color=(0.3, 0.75, 0.4, 1))
         btn.bind(on_press=lambda *_: start_cb())
@@ -334,20 +361,20 @@ class GameOverScreen(FloatLayout):
             self.rect = Rectangle(pos=(0, 0), size=Window.size)
         self.bind(size=self._upd, pos=self._upd)
 
-        box_label = Label(text="💥 خسرت!", font_size=48, bold=True, color=(1, 1, 1, 1),
-                           pos_hint={"center_x": 0.5, "center_y": 0.62})
+        box_label = Label(text="Game Over", font_size=48, bold=True, color=(1, 1, 1, 1),
+                          pos_hint={"center_x": 0.5, "center_y": 0.62})
         self.add_widget(box_label)
 
-        score_label = Label(text=f"نقاطك: {score}", font_size=28, color=(1, 1, 1, 1),
-                             pos_hint={"center_x": 0.5, "center_y": 0.52})
+        score_label = Label(text=f"Score: {score}", font_size=28, color=(1, 1, 1, 1),
+                            pos_hint={"center_x": 0.5, "center_y": 0.52})
         self.add_widget(score_label)
 
-        cp_text = f"هتبدأ من: {checkpoint}" if checkpoint > 0 else "هتبدأ من الأول"
+        cp_text = f"Restart from: {checkpoint}" if checkpoint > 0 else "Restart from the beginning"
         cp_label = Label(text=cp_text, font_size=22, color=(1, 1, 0.6, 1),
-                          pos_hint={"center_x": 0.5, "center_y": 0.44})
+                         pos_hint={"center_x": 0.5, "center_y": 0.44})
         self.add_widget(cp_label)
 
-        btn = Button(text="كمّل تاني", font_size=26, size_hint=(None, None), size=(200, 65),
+        btn = Button(text="Continue", font_size=26, size_hint=(None, None), size=(200, 65),
                      pos_hint={"center_x": 0.5, "center_y": 0.3},
                      background_color=(0.3, 0.75, 0.4, 1))
         btn.bind(on_press=lambda *_: restart_cb())
@@ -360,7 +387,7 @@ class GameOverScreen(FloatLayout):
 
 class NattatApp(App):
     def build(self):
-        self.title = "نطاط"
+        self.title = "Nattat"
         Window.clearcolor = (1, 1, 1, 1)
         self.root_widget = FloatLayout()
         self.game = None
