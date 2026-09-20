@@ -1,416 +1,377 @@
+import math
+import os
 import random
+import struct
+import wave
+
 from kivy.app import App
-from kivy.uix.floatlayout import FloatLayout
-from kivy.uix.label import Label
-from kivy.uix.button import Button
-from kivy.uix.image import Image
-from kivy.graphics import Rectangle, Color
 from kivy.clock import Clock
+from kivy.core.audio import SoundLoader
 from kivy.core.window import Window
+from kivy.graphics import (Color, Ellipse, Line, PopMatrix, PushMatrix,
+                           Rectangle, Rotate)
+from kivy.metrics import sp
+from kivy.uix.label import Label
+from kivy.uix.widget import Widget
 
-# ---------------- Tunable constants ----------------
-GRAVITY = -1300
-JUMP_VELOCITY = 1100
-ROCKET_VELOCITY = 1700
-PLATFORM_W = 160
-PLATFORM_H = 32
-PLAYER_W = 70
-PLAYER_H = 70
-STAGE_HEIGHT = 1400          # score (px) per stage
-STARS_FOR_CHECKPOINT = 3
-SCROLL_START_Y = 0.45        # fraction of screen height where the world starts scrolling
-FOLLOW = 12                  # how quickly the frog follows your finger
-MAX_MOVE_SPEED = 1200        # top horizontal speed (px/s)
-MIRROR_TOUCH = False         # set to True if the frog goes the opposite way of your finger
+# ===== Settings (sizes are fractions of the screen size) =====
+GRAVITY = 1.8            # higher = falls faster
+JUMP_VELOCITY = 1.04     # higher = jumps higher
+PLATFORM_W = 0.22        # platform width
+PLAYER_SIZE = 0.09       # player size at level 1
+MIN_GAP = 0.09           # min vertical gap between platforms
+MAX_GAP = 0.19           # max gap (keep below jump height ~0.30)
+MILESTONE_EVERY = 100    # chime every N points
+LEVEL_POINTS = 1000      # points needed for each new level
+GROWTH_PER_LEVEL = 0.08  # player grows 8% every level
+MAX_GROWTH = 1.9         # player never gets bigger than 1.9x
+PLATFORM_SHRINK = 0.03   # platforms get 3% narrower each level (0 = off)
+MIN_PLATFORM_SCALE = 0.6
+
+MOVES = ["flip", "backflip", "dance", "dance", "spin"]
 
 
-class GameWidget(FloatLayout):
-    def __init__(self, app, **kwargs):
+# ===== Sound effects: generated in code, no audio files needed =====
+def make_wav(path, segments, rate=22050):
+    """segments = list of (start_freq, end_freq, seconds, volume)"""
+    frames = bytearray()
+    for f0, f1, dur, vol in segments:
+        n = int(rate * dur)
+        phase = 0.0
+        for i in range(n):
+            t = i / n
+            freq = f0 + (f1 - f0) * t
+            phase += 2 * math.pi * freq / rate
+            env = (1 - t) ** 1.5
+            if i < 120:                      # short fade-in to avoid clicks
+                env *= i / 120
+            value = int(32767 * vol * env * math.sin(phase))
+            frames += struct.pack("<h", value)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+
+
+def build_sounds(folder):
+    os.makedirs(folder, exist_ok=True)
+    files = {
+        "bounce": [(380, 820, 0.11, 0.45)],
+        "milestone": [(660, 660, 0.09, 0.4), (990, 990, 0.16, 0.4)],
+        "levelup": [(523, 523, 0.09, 0.4), (659, 659, 0.09, 0.4),
+                    (784, 784, 0.09, 0.4), (1046, 1046, 0.25, 0.45)],
+        "over": [(520, 110, 0.65, 0.5)],
+    }
+    sounds = {}
+    for name, segments in files.items():
+        path = os.path.join(folder, name + ".wav")
+        try:
+            make_wav(path, segments)
+            sounds[name] = SoundLoader.load(path)
+        except Exception:
+            sounds[name] = None
+    return sounds
+
+
+class Game(Widget):
+    def __init__(self, sounds=None, **kwargs):
         super().__init__(**kwargs)
-        self.app = app
-        self.width_ = Window.width
-        self.height_ = Window.height
+        self.sounds = sounds or {}
+        self.sound_on = True
+        self.score_label = Label(text="0", font_size=sp(28))
+        self.level_label = Label(text="Level 1", font_size=sp(18))
+        self.sound_label = Label(text="Sound: ON", font_size=sp(16))
+        self.banner_label = Label(text="", font_size=sp(44))
+        self.msg_label = Label(text="", font_size=sp(30), halign="center",
+                               valign="middle")
+        for w in (self.score_label, self.level_label, self.sound_label,
+                  self.banner_label, self.msg_label):
+            self.add_widget(w)
+        self.touch_id = None
+        self.reset()
 
-        # background
-        with self.canvas.before:
-            self.bg = Rectangle(source="assets/bg.png", pos=(0, 0), size=(self.width_, self.height_))
-        self.bind(size=self._update_bg, pos=self._update_bg)
+    def play(self, name):
+        if not self.sound_on:
+            return
+        s = self.sounds.get(name)
+        if s:
+            try:
+                s.stop()
+                s.play()
+            except Exception:
+                pass
 
-        # state
-        self._active_touch = None
-        self.reset_state(full_reset=True)
-
-        # player sprite
-        self.player = Image(source="assets/character.png", size=(PLAYER_W, PLAYER_H),
-                            size_hint=(None, None))
-        self.add_widget(self.player)
-
-        # HUD
-        self.score_label = Label(text="0", font_size=28, bold=True,
-                                 pos_hint={"x": 0.02, "top": 0.99}, size_hint=(None, None),
-                                 size=(150, 40), color=(0.1, 0.1, 0.1, 1))
-        self.add_widget(self.score_label)
-
-        self.stars_label = Label(text=f"Stars {self.total_stars}/{STARS_FOR_CHECKPOINT}",
-                                 font_size=22, bold=True,
-                                 pos_hint={"right": 0.98, "top": 0.99}, size_hint=(None, None),
-                                 size=(180, 40), color=(0.5, 0.3, 0, 1))
-        self.add_widget(self.stars_label)
-
-        self.shield_label = Label(text="", font_size=20, bold=True,
-                                  pos_hint={"center_x": 0.5, "top": 0.99}, size_hint=(None, None),
-                                  size=(200, 40), color=(0.1, 0.6, 0.1, 1))
-        self.add_widget(self.shield_label)
-
-        self.platform_widgets = []
-        self.item_widgets = []  # list of dicts: {"widget", "kind", "platform", "collected"}
-
-        self.spawn_initial_platforms()
-        self.place_player_on_start()
-
-        Clock.schedule_interval(self.update, 1 / 60)
-
-    # ---------------- setup helpers ----------------
-    def _update_bg(self, *args):
-        self.width_ = self.width
-        self.height_ = self.height
-        self.bg.pos = (0, 0)
-        self.bg.size = (self.width_, self.height_)
-
-    def reset_state(self, full_reset=False):
-        self.vel_y = 0
-        self.target_x = None
-        self._active_touch = None
-        self.scroll_offset = 0
-        self.score = 0
-        self.max_score = 0
+    def reset(self):
+        W, H = Window.size
+        self.level = 1
+        self.scale = 1.0
+        self.pw = PLAYER_SIZE * W
+        self.px = W / 2
+        self.py = H * 0.09          # py = the player's feet
+        self.vy = JUMP_VELOCITY * H
+        self.vx = 0.0
+        self.tilt = 0.0
+        self.score = 0.0
+        self.next_mark = MILESTONE_EVERY
+        self.banner_t = 0.0
+        self.special = False
         self.game_over = False
-        self.shield_active = False
-        self.rocket_active = False
-        self.rocket_timer = 0
-        self.current_stage = 0
-        if full_reset:
-            self.total_stars = 0
-            self.checkpoint_score = 0
-            self.checkpoint_platform_seed = None
+        self.touch_x = None
+        self.touch_id = None
+        # first platform spans the whole width so you never miss it
+        self.platforms = [[W / 2, H * 0.08, W]]
+        self.top = H * 0.08
+        self.fill()
+        self.start_move()
+        self.msg_label.text = ""
+        self.banner_label.text = ""
 
-    def clear_world(self):
-        for w in getattr(self, "platform_widgets", []):
-            self.remove_widget(w["widget"])
-        for it in getattr(self, "item_widgets", []):
-            if it["widget"].parent:
-                self.remove_widget(it["widget"])
-        self.platform_widgets = []
-        self.item_widgets = []
+    def platform_width(self, W):
+        shrink = max(MIN_PLATFORM_SCALE, 1 - PLATFORM_SHRINK * (self.level - 1))
+        return PLATFORM_W * W * shrink
 
-    def spawn_initial_platforms(self):
-        self.clear_world()
-        # starting platform right under the player
-        base_x = self.width_ / 2 - PLATFORM_W / 2
-        base_y = 120
-        self.add_platform(base_x, base_y, breakable=False)
-        y = base_y
-        while y < self.height_ + 400:
-            y += random.randint(90, 150)
-            x = random.uniform(10, max(10, self.width_ - PLATFORM_W - 10))
-            self.add_platform(x, y)
-        self.top_spawn_y = y
+    def fill(self):
+        W, H = Window.size
+        pwid = self.platform_width(W)
+        while self.top < H * 1.3:
+            self.top += random.uniform(MIN_GAP, MAX_GAP) * H
+            x = random.uniform(pwid / 2, W - pwid / 2)
+            self.platforms.append([x, self.top, pwid])
 
-    def add_platform(self, x, y, breakable=None):
-        difficulty = min(self.checkpoint_score / 4000, 1.0)
-        if breakable is None:
-            breakable = random.random() < 0.15 + 0.15 * difficulty
-        src = "assets/platform_crack.png" if breakable else "assets/platform.png"
-        w = Image(source=src, size=(PLATFORM_W, PLATFORM_H), size_hint=(None, None), pos=(x, y))
-        self.add_widget(w)
-        pdata = {"widget": w, "x": x, "y": y, "breakable": breakable, "broken": False}
-        self.platform_widgets.append(pdata)
+    # ===== Tricks: a new one is picked on every bounce =====
+    def start_move(self):
+        self.move_t = 0.0
+        self.turns = 1
+        if self.special:                       # level-up celebration
+            self.special = False
+            self.move = random.choice(["flip", "backflip"])
+            self.turns = 2
+            return
+        self.move = random.choice(MOVES)
+        if (self.move in ("flip", "backflip", "spin")
+                and random.random() < min(0.4, 0.08 * self.level)):
+            self.turns = 2
 
-        # chance of an item on top
-        roll = random.random()
-        if roll < 0.12:
-            self.add_item(x + PLATFORM_W / 2 - 16, y + PLATFORM_H, "star", pdata)
-        elif roll < 0.15:
-            self.add_item(x + PLATFORM_W / 2 - 16, y + PLATFORM_H, "rocket", pdata)
-        return pdata
+    def get_pose(self, H):
+        t = self.move_t
+        air = 2 * JUMP_VELOCITY / GRAVITY          # seconds in the air
+        prog = min(t / (air * 0.85), 1.0)
+        ease = prog * prog * (3 - 2 * prog)
+        k = max(-1.0, min(1.0, self.vy / (JUMP_VELOCITY * H)))
+        arms = -20 + 70 * k                        # arms rise when going up
+        pose = {"angle": 0.0, "sx": 1.0, "sy": 1.0,
+                "arm_l": arms, "arm_r": arms, "leg_l": 0.0, "leg_r": 0.0}
 
-    def add_item(self, x, y, kind, platform):
-        size = (32, 32) if kind == "star" else (44, 66)
-        src = f"assets/{kind}.png"
-        w = Image(source=src, size=size, size_hint=(None, None), pos=(x, y))
-        self.add_widget(w)
-        self.item_widgets.append({"widget": w, "kind": kind, "platform": platform, "collected": False})
+        if self.move in ("flip", "backflip"):
+            direction = 1 if self.move == "backflip" else -1
+            pose["angle"] = direction * 360 * self.turns * ease
+            pose["arm_l"] = pose["arm_r"] = 25
+        elif self.move == "dance":
+            s = math.sin(t * 16)
+            pose["angle"] = 12 * math.sin(t * 8)
+            pose["arm_l"] = 55 + 45 * s
+            pose["arm_r"] = 55 - 45 * s
+            pose["leg_l"] = 0.16 * s
+            pose["leg_r"] = -0.16 * s
+        elif self.move == "spin":
+            pose["sx"] = max(0.15, abs(math.cos(2 * math.pi * self.turns * ease)))
 
-    def place_player_on_start(self):
-        base = self.platform_widgets[0]
-        self.player.pos = (base["x"] + PLATFORM_W / 2 - PLAYER_W / 2, base["y"] + PLATFORM_H)
-        self.vel_y = JUMP_VELOCITY * 0.6
+        # squash when landing
+        if t < 0.12:
+            q = 1 - t / 0.12
+            pose["sy"] *= 1 - 0.3 * q
+            pose["sx"] *= 1 + 0.25 * q
 
-    # ---------------- input ----------------
-    # Touch anywhere and the frog goes to where your finger is.
-    # Slide your finger left/right to steer. Lift the finger and the frog stays put.
-    def _set_target(self, touch):
-        x = self.width - touch.x if MIRROR_TOUCH else touch.x
-        self.target_x = x - PLAYER_W / 2
+        pose["angle"] += self.tilt                 # lean toward the finger
+        return pose
 
+    # ===== Touch: the player follows your finger =====
     def on_touch_down(self, touch):
+        W, H = Window.size
+        # sound on/off button (top-right corner)
+        if touch.x > W - sp(120) and touch.y > H - sp(60):
+            self.sound_on = not self.sound_on
+            self.sound_label.text = "Sound: ON" if self.sound_on else "Sound: OFF"
+            return True
         if self.game_over:
-            return False
-        self._active_touch = touch
-        self._set_target(touch)
+            self.reset()
+            return True
+        self.touch_id = touch.uid
+        self.touch_x = touch.x
         return True
 
     def on_touch_move(self, touch):
-        if self.game_over:
-            return False
-        if touch is self._active_touch:
-            self._set_target(touch)
-            return True
-        return False
+        if touch.uid == self.touch_id:
+            self.touch_x = touch.x
+        return True
 
     def on_touch_up(self, touch):
-        if touch is self._active_touch:
-            self._active_touch = None
-            self.target_x = None
-            return True
-        return False
+        if touch.uid == self.touch_id:
+            self.touch_x = None
+            self.touch_id = None
+        return True
 
-    # ---------------- game loop ----------------
+    # ===== Game loop =====
     def update(self, dt):
-        if self.game_over:
-            return
-        dt = min(dt, 1 / 30)  # avoid big jumps when a frame is slow
+        W, H = Window.size
+        dt = min(dt, 1 / 30)
+        self.move_t += dt
+        if self.banner_t > 0:
+            self.banner_t -= dt
 
-        self.handle_horizontal(dt)
+        # the player grows smoothly with the level
+        target = min(MAX_GROWTH, 1 + GROWTH_PER_LEVEL * (self.level - 1))
+        self.scale += (target - self.scale) * min(1, dt * 4)
+        self.pw = PLAYER_SIZE * W * self.scale
+        total_h = self.pw * 1.3
 
-        # physics
-        prev_y = self.player.y
-        if self.rocket_active:
-            self.vel_y = ROCKET_VELOCITY
-            self.rocket_timer -= dt
-            if self.rocket_timer <= 0:
-                self.rocket_active = False
-        else:
-            self.vel_y += GRAVITY * dt
+        points = int(self.score / H * 100)
 
-        self.player.y = self.player.y + self.vel_y * dt
+        if not self.game_over:
+            prev_px = self.px
+            if self.touch_x is not None:
+                self.px = min(max(self.touch_x, 0), W)
+            if dt > 0:
+                inst = (self.px - prev_px) / dt
+                self.vx += (inst - self.vx) * min(1, dt * 12)
+            self.tilt = -max(-1.0, min(1.0, self.vx / (W * 2))) * 18
 
-        # platform collisions only while falling
-        if self.vel_y <= 0:
-            for p in self.platform_widgets:
-                if p["broken"]:
-                    continue
-                px, py = p["x"], p["y"]
-                top = py + PLATFORM_H
-                if (self.player.x + PLAYER_W * 0.7 > px and self.player.x + PLAYER_W * 0.3 < px + PLATFORM_W
-                        and prev_y >= top - 12 and self.player.y <= top):
-                    self.land_on_platform(p)
-                    break
+            prev_feet = self.py
+            self.vy -= GRAVITY * H * dt
+            self.py += self.vy * dt
 
-        # scroll the world when the player passes the threshold
-        threshold = self.height_ * SCROLL_START_Y
-        if self.player.y > threshold:
-            dy = self.player.y - threshold
-            self.player.y = threshold
-            self.scroll_world(dy)
+            # landing on a platform (only while falling)
+            if self.vy <= 0:
+                half = self.pw / 2
+                for x, y, w in self.platforms:
+                    if (prev_feet >= y - 1 and self.py <= y
+                            and abs(self.px - x) <= w / 2 + half * 0.6):
+                        self.py = y
+                        self.vy = JUMP_VELOCITY * H
+                        self.play("bounce")
+                        self.start_move()
+                        break
 
-        # item collisions
-        self.check_item_collisions()
+            # scroll the world down when the player goes high
+            if self.py > H * 0.6:
+                shift = self.py - H * 0.6
+                self.py -= shift
+                self.top -= shift
+                self.score += shift
+                for p in self.platforms:
+                    p[1] -= shift
+                self.platforms = [p for p in self.platforms if p[1] > -H * 0.05]
+                self.fill()
 
-        # fell off the bottom -> die
-        if self.player.y < -PLAYER_H:
-            self.die()
-            if self.game_over:
-                return
+            points = int(self.score / H * 100)
 
-        # update score
-        self.score = max(self.score, int(self.scroll_offset))
-        self.score_label.text = str(self.score)
-        stage = self.score // STAGE_HEIGHT
-        if stage != self.current_stage:
-            self.current_stage = stage
-            self.shield_active = False  # shield resets every new stage until earned again
-        self.shield_label.text = "SHIELD" if self.shield_active else ""
+            # level up / milestone chime
+            new_level = points // LEVEL_POINTS + 1
+            if new_level > self.level:
+                self.level = new_level
+                self.special = True                # next bounce = double flip
+                self.banner_t = 1.6
+                self.play("levelup")
+            elif points >= self.next_mark:
+                self.play("milestone")
+            while points >= self.next_mark:
+                self.next_mark += MILESTONE_EVERY
 
-    def handle_horizontal(self, dt):
-        # move toward the finger smoothly, with a speed limit
-        if self.target_x is not None:
-            diff = self.target_x - self.player.x
-            step = diff * min(1.0, FOLLOW * dt)
-            max_step = MAX_MOVE_SPEED * dt
-            step = max(-max_step, min(max_step, step))
-            self.player.x += step
-        # stay inside the screen
-        self.player.x = max(0, min(self.width_ - PLAYER_W, self.player.x))
+            # fell off the bottom
+            if self.py + total_h < 0:
+                self.game_over = True
+                self.play("over")
+                self.msg_label.text = ("Game Over\nScore: %d\nLevel: %d\n"
+                                       "Tap to restart" % (points, self.level))
 
-    def land_on_platform(self, p):
-        self.vel_y = JUMP_VELOCITY
-        if p["breakable"]:
-            p["broken"] = True
-            p["widget"].opacity = 0
+        self.draw(W, H, points)
 
-    def scroll_world(self, dy):
-        self.scroll_offset += dy
-        for p in self.platform_widgets:
-            p["y"] -= dy
-            p["widget"].y = p["y"]
-        for it in self.item_widgets:
-            it["widget"].y -= dy
+    def draw_player(self, H):
+        pose = self.get_pose(H)
+        pw = self.pw
+        bw = pw * pose["sx"]
+        bh = pw * pose["sy"]
+        leg = pw * 0.28
+        arm = pw * 0.42 * (0.3 + 0.7 * pose["sx"])
+        cx = self.px
+        cy = self.py + leg + bh / 2
+        lw = max(sp(2), pw * 0.07)
 
-        # remove off-screen platforms/items, spawn new ones on top
-        keep_platforms = []
-        for p in self.platform_widgets:
-            if p["y"] < -60:
-                self.remove_widget(p["widget"])
-            else:
-                keep_platforms.append(p)
-        self.platform_widgets = keep_platforms
+        PushMatrix()
+        Rotate(angle=pose["angle"], origin=(cx, cy))
 
-        keep_items = []
-        for it in self.item_widgets:
-            if it["widget"].y < -60 or it["collected"]:
-                if it["widget"].parent:
-                    self.remove_widget(it["widget"])
-            else:
-                keep_items.append(it)
-        self.item_widgets = keep_items
+        # legs and arms
+        Color(0.95, 0.6, 0.1)
+        for side, kick, lift in ((-1, pose["leg_l"], pose["arm_l"]),
+                                 (1, pose["leg_r"], pose["arm_r"])):
+            x0 = cx + side * bw * 0.2
+            y0 = cy - bh / 2
+            Line(points=[x0, y0, x0 + kick * pw, self.py], width=lw)
+            a = math.radians(lift)
+            sx0 = cx + side * bw / 2
+            sy0 = cy + bh * 0.05
+            Line(points=[sx0, sy0, sx0 + side * math.cos(a) * arm,
+                         sy0 + math.sin(a) * arm], width=lw)
 
-        self.top_spawn_y -= dy
-        while self.top_spawn_y < self.height_ + 300:
-            self.top_spawn_y += random.randint(90, 150)
-            x = random.uniform(10, max(10, self.width_ - PLATFORM_W - 10))
-            self.add_platform(x, self.top_spawn_y)
+        # body
+        Color(1, 0.85, 0.2)
+        Ellipse(pos=(cx - bw / 2, cy - bh / 2), size=(bw, bh))
 
-    def check_item_collisions(self):
-        for it in self.item_widgets:
-            if it["collected"]:
-                continue
-            w = it["widget"]
-            wx, wy = w.x, w.y
-            if (self.player.x < wx + w.width and self.player.x + PLAYER_W > wx
-                    and self.player.y < wy + w.height and self.player.y + PLAYER_H > wy):
-                it["collected"] = True
-                w.opacity = 0
-                if it["kind"] == "star":
-                    self.collect_star()
-                elif it["kind"] == "rocket":
-                    self.activate_rocket()
+        # eyes (they look where you are moving)
+        look = max(-1.0, min(1.0, self.vx / (Window.width * 1.5)))
+        ew, eh = bw * 0.22, bh * 0.26
+        for side in (-1, 1):
+            ex = cx + side * bw * 0.2
+            ey = cy + bh * 0.12
+            Color(1, 1, 1)
+            Ellipse(pos=(ex - ew / 2, ey - eh / 2), size=(ew, eh))
+            Color(0.1, 0.1, 0.1)
+            pd = ew * 0.5
+            Ellipse(pos=(ex - pd / 2 + look * ew * 0.2, ey - pd / 2),
+                    size=(pd, pd))
 
-    def collect_star(self):
-        self.total_stars += 1
-        if self.total_stars >= STARS_FOR_CHECKPOINT:
-            self.total_stars = 0
-            self.checkpoint_score = self.score
-            self.shield_active = True
-        self.stars_label.text = f"Stars {self.total_stars}/{STARS_FOR_CHECKPOINT}"
+        # smile
+        Color(0.5, 0.25, 0.05)
+        Line(circle=(cx, cy - bh * 0.05, bw * 0.16, 90, 270),
+             width=max(sp(1.5), lw * 0.6))
 
-    def activate_rocket(self):
-        self.rocket_active = True
-        self.rocket_timer = 1.6
+        PopMatrix()
 
-    def die(self):
-        if self.shield_active:
-            # the shield absorbs the fall once and bounces the player back up
-            self.shield_active = False
-            self.vel_y = JUMP_VELOCITY
-            self.player.y = self.height_ * SCROLL_START_Y - 40
-            return
-        self.game_over = True
-        self.target_x = None
-        self.app.show_game_over(self.score, self.checkpoint_score)
-
-    def restart_from_checkpoint(self):
-        self.reset_state(full_reset=False)
-        self.score = self.checkpoint_score
-        self.spawn_initial_platforms()
-        self.place_player_on_start()
-        self.stars_label.text = f"Stars {self.total_stars}/{STARS_FOR_CHECKPOINT}"
-
-
-class MenuScreen(FloatLayout):
-    def __init__(self, start_cb, **kwargs):
-        super().__init__(**kwargs)
+    def draw(self, W, H, points):
+        self.canvas.before.clear()
         with self.canvas.before:
-            self.bg = Rectangle(source="assets/bg.png", pos=(0, 0), size=Window.size)
-        self.bind(size=self._upd, pos=self._upd)
+            Color(0.08, 0.09, 0.16)
+            Rectangle(pos=(0, 0), size=(W, H))
+            Color(0.3, 0.85, 0.4)
+            th = H * 0.015
+            for x, y, w in self.platforms:
+                Rectangle(pos=(x - w / 2, y - th), size=(w, th))
+            self.draw_player(H)
 
-        title = Label(text="Nattat", font_size=64, bold=True, color=(0.1, 0.3, 0.1, 1),
-                      pos_hint={"center_x": 0.5, "center_y": 0.65})
-        self.add_widget(title)
-
-        char = Image(source="assets/character.png", size=(140, 140), size_hint=(None, None),
-                     pos_hint={"center_x": 0.5, "center_y": 0.45})
-        self.add_widget(char)
-
-        btn = Button(text="Start", font_size=28, size_hint=(None, None), size=(220, 70),
-                     pos_hint={"center_x": 0.5, "center_y": 0.22},
-                     background_color=(0.3, 0.75, 0.4, 1))
-        btn.bind(on_press=lambda *_: start_cb())
-        self.add_widget(btn)
-
-    def _upd(self, *a):
-        self.bg.pos = (0, 0)
-        self.bg.size = self.size
-
-
-class GameOverScreen(FloatLayout):
-    def __init__(self, score, checkpoint, restart_cb, **kwargs):
-        super().__init__(**kwargs)
-        with self.canvas.before:
-            Color(0, 0, 0, 0.55)
-            self.rect = Rectangle(pos=(0, 0), size=Window.size)
-        self.bind(size=self._upd, pos=self._upd)
-
-        box_label = Label(text="Game Over", font_size=48, bold=True, color=(1, 1, 1, 1),
-                          pos_hint={"center_x": 0.5, "center_y": 0.62})
-        self.add_widget(box_label)
-
-        score_label = Label(text=f"Score: {score}", font_size=28, color=(1, 1, 1, 1),
-                            pos_hint={"center_x": 0.5, "center_y": 0.52})
-        self.add_widget(score_label)
-
-        cp_text = f"Restart from: {checkpoint}" if checkpoint > 0 else "Restart from the beginning"
-        cp_label = Label(text=cp_text, font_size=22, color=(1, 1, 0.6, 1),
-                         pos_hint={"center_x": 0.5, "center_y": 0.44})
-        self.add_widget(cp_label)
-
-        btn = Button(text="Continue", font_size=26, size_hint=(None, None), size=(200, 65),
-                     pos_hint={"center_x": 0.5, "center_y": 0.3},
-                     background_color=(0.3, 0.75, 0.4, 1))
-        btn.bind(on_press=lambda *_: restart_cb())
-        self.add_widget(btn)
-
-    def _upd(self, *a):
-        self.rect.pos = (0, 0)
-        self.rect.size = self.size
+        self.score_label.text = str(points)
+        self.score_label.size = (W, sp(50))
+        self.score_label.pos = (0, H - sp(60))
+        self.level_label.text = "Level %d" % self.level
+        self.level_label.size = (sp(120), sp(50))
+        self.level_label.pos = (0, H - sp(60))
+        self.sound_label.size = (sp(120), sp(50))
+        self.sound_label.pos = (W - sp(120), H - sp(60))
+        self.banner_label.text = ("LEVEL %d" % self.level
+                                  if self.banner_t > 0 and not self.game_over else "")
+        self.banner_label.size = (W, sp(70))
+        self.banner_label.pos = (0, H * 0.7)
+        self.msg_label.size = (W, H * 0.3)
+        self.msg_label.text_size = (W, H * 0.3)
+        self.msg_label.pos = (0, H * 0.35)
 
 
 class NattatApp(App):
     def build(self):
-        self.title = "Nattat"
-        Window.clearcolor = (1, 1, 1, 1)
-        self.root_widget = FloatLayout()
-        self.game = None
-        self.show_menu()
-        return self.root_widget
-
-    def show_menu(self):
-        self.root_widget.clear_widgets()
-        self.root_widget.add_widget(MenuScreen(self.start_game))
-
-    def start_game(self):
-        self.root_widget.clear_widgets()
-        self.game = GameWidget(self)
-        self.root_widget.add_widget(self.game)
-
-    def show_game_over(self, score, checkpoint):
-        overlay = GameOverScreen(score, checkpoint, self.restart_game)
-        self.root_widget.add_widget(overlay)
-
-    def restart_game(self):
-        self.root_widget.clear_widgets()
-        self.game.restart_from_checkpoint()
-        self.root_widget.add_widget(self.game)
+        sounds = build_sounds(os.path.join(self.user_data_dir, "sfx"))
+        game = Game(sounds=sounds)
+        Clock.schedule_interval(game.update, 1 / 60)
+        return game
 
 
 if __name__ == "__main__":
